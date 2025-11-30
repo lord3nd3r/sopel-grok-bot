@@ -30,3 +30,4 @@ pip install sopel requests
 
 # 3. Copy the plugin to your Sopel scripts folder
 cp grok.py ~/.sopel/scripts/
+#4. copy the text from the cfg into your sopel config and edit it as needed.
