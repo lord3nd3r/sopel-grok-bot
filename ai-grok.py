@@ -1,3 +1,4 @@
+# grok.py — FINAL v3: Safe, fun, actually tells dad jokes now
 from sopel import plugin
 from sopel.config import types
 from collections import deque
