@@ -1,10 +1,11 @@
-# grok.py — FINAL v3: Safe, fun, actually tells dad jokes now
+# grok.py — FINAL v4: remembers more, still safe & fun
 from sopel import plugin
 from sopel.config import types
 from collections import deque
 import requests
 import time
 import re
+
 
 class GrokSection(types.StaticSection):
     api_key = types.SecretAttribute('api_key')
@@ -15,8 +16,13 @@ class GrokSection(types.StaticSection):
     )
     system_prompt = types.ValidatedAttribute(
         'system_prompt',
-        default="You are Grok, a witty and helpful AI in an IRC channel. Be concise, fun, and friendly. Never output code blocks, ASCII art, figlet, or @everyone mentions."
+        default=(
+            "You are Grok, a witty and helpful AI in an IRC channel. "
+            "Be concise, fun, and friendly. Never output code blocks, ASCII art, "
+            "figlet, or @everyone mentions."
+        ),
     )
+
 
 def setup(bot):
     bot.config.define_section('grok', GrokSection)
@@ -27,8 +33,10 @@ def setup(bot):
         "Authorization": f"Bearer {bot.config.grok.api_key}",
         "Content-Type": "application/json",
     }
-    bot.memory['grok_history'] = {}   # channel → deque
+    # Per-channel rolling history & last-response time
+    bot.memory['grok_history'] = {}   # channel → deque(["nick: text", ...])
     bot.memory['grok_last'] = {}      # channel → timestamp
+
 
 def send(bot, channel, text):
     max_len = 440
@@ -38,54 +46,92 @@ def send(bot, channel, text):
         if len(part) == max_len:
             time.sleep(delay)
 
+
 @plugin.event('PRIVMSG')
 @plugin.rule('.*')
 @plugin.priority('high')
 def handle(bot, trigger):
+    # Only respond in channels
     if not trigger.sender.startswith('#'):
         return
 
     line = trigger.group(0).strip()
     bot_nick = bot.nick
 
-    # Require explicit mention of bot nick
-    if not re.search(rf'\b{re.escape(bot_nick)}\b', line, re.IGNORECASE):
+    # --- Filter genuine IRC noise (but keep ACTION/emote lines!) ---
+    noise_patterns = [
+        r'^MODE ',                         # mode changes
+        r'has (joined|quit|left|parted)',  # join/quit spam
+    ]
+    if any(re.search(p, line, re.IGNORECASE) for p in noise_patterns):
         return
 
-    # Clean message: remove "grok:", "grok," etc.
-    user_message = re.sub(rf'^{re.escape(bot_nick)}[,:>\s]+', '', line, flags=re.IGNORECASE).strip()
+    # --- Detect whether the bot is explicitly mentioned ---
+    mentioned = bool(
+        re.search(rf'\b{re.escape(bot_nick)}\b', line, re.IGNORECASE)
+    )
+
+    # --- Prepare text for history ---
+    # If they addressed the bot, strip a leading "grok: ", "grok," etc from history text.
+    if mentioned:
+        text_for_history = re.sub(
+            rf'^{re.escape(bot_nick)}[,:>\s]+',
+            '',
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+    else:
+        # No mention: store the line as-is so Grok still has channel context
+        text_for_history = line.strip()
+
+    # Initialize per-channel history and append this message
+    history = bot.memory['grok_history'].setdefault(
+        trigger.sender,
+        deque(maxlen=50),
+    )
+    if text_for_history:
+        history.append(f"{trigger.nick}: {text_for_history}")
+
+    # If they didn't mention the bot, don't wake it up — just keep the context
+    if not mentioned:
+        return
+
+    # This is the text we treat as the "current user message" to Grok
+    user_message = text_for_history
+
+    # Ignore empty messages after cleaning
     if not user_message:
         return
 
-    # Ignore bot commands
+    # Ignore bot commands like ".help", "/whatever", "!foo"
     if re.match(r'^[.!/]', user_message):
         return
 
-    # Filter IRC noise
-    noise = [
-        r'^\* ', r'^\001ACTION', r'^MODE ', r'has (joined|quit|left|parted)'
-    ]
-    if any(re.search(p, line, re.IGNORECASE) for p in noise):
-        return
-
-    # Rate limit: 4 seconds per channel
+    # --- Rate limit: 4 seconds per channel ---
     now = time.time()
     last = bot.memory['grok_last'].get(trigger.sender, 0)
     if now - last < 4:
         return
     bot.memory['grok_last'][trigger.sender] = now
 
-    # History
-    history = bot.memory['grok_history'].setdefault(trigger.sender, deque(maxlen=50))
-    history.append(f"{trigger.nick}: {user_message}")
+    # --- Build Grok conversation messages from history ---
+    messages = [
+        {"role": "system", "content": bot.config.grok.system_prompt}
+    ]
 
-    # Build message list
-    messages = [{"role": "system", "content": bot.config.grok.system_prompt}]
     for entry in history:
-        nick, text = entry.split(": ", 1)
+        # Each entry is "nick: text"
+        try:
+            nick, text = entry.split(": ", 1)
+        except ValueError:
+            # Fallback if somehow malformed; treat whole thing as user text
+            nick = "user"
+            text = entry
+
         role = "assistant" if nick == bot_nick else "user"
         messages.append({"role": role, "content": text})
 
+    # --- Call x.ai API ---
     try:
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
@@ -113,7 +159,12 @@ def handle(bot, trigger):
         reply = re.sub(r'[\u2580-\u259F]{5,}', ' ', reply)
 
         # 4. Block dangerous pings
-        reply = re.sub(r'@(everyone|here)\b', '(nope)', reply, flags=re.IGNORECASE)
+        reply = re.sub(
+            r'@(everyone|here)\b',
+            '(nope)',
+            reply,
+            flags=re.IGNORECASE,
+        )
 
         # 5. Only truncate truly massive replies
         if len(reply) > 1400:
@@ -125,12 +176,16 @@ def handle(bot, trigger):
         else:
             final_reply = reply
 
+        # Send reply
         send(bot, trigger.sender, final_reply)
+
+        # Log assistant turn into history for future context
         history.append(f"{bot_nick}: {reply}")
 
     except Exception:
         # Silent fail — bot lives on
         pass
+
 
 @plugin.command('grokreset')
 @plugin.require_owner()
