@@ -1,4 +1,4 @@
-# grok.py — FINAL v4: remembers more, still safe & fun
+# grok.py — FINAL v5: channel blocking + saner per-user context
 from sopel import plugin
 from sopel.config import types
 from collections import deque
@@ -22,6 +22,9 @@ class GrokSection(types.StaticSection):
             "figlet, or @everyone mentions."
         ),
     )
+    # Comma-separated list in the config, e.g.:
+    # blocked_channels = #ops,#secret
+    blocked_channels = types.ListAttribute('blocked_channels', default=[])
 
 
 def setup(bot):
@@ -53,6 +56,11 @@ def send(bot, channel, text):
 def handle(bot, trigger):
     # Only respond in channels
     if not trigger.sender.startswith('#'):
+        return
+
+    # Block-list channels from config; no logging, no replies
+    blocked = {c.lower() for c in bot.config.grok.blocked_channels}
+    if trigger.sender.lower() in blocked:
         return
 
     line = trigger.group(0).strip()
@@ -116,20 +124,40 @@ def handle(bot, trigger):
 
     # --- Build Grok conversation messages from history ---
     messages = [
-        {"role": "system", "content": bot.config.grok.system_prompt}
+        {"role": "system", "content": bot.config.grok.system_prompt},
+        {
+            "role": "system",
+            "content": (
+                f"You are currently replying to the IRC nick {trigger.nick}. "
+                f"Ignore other users in the channel unless {trigger.nick} explicitly "
+                f"asks you about them. Treat previous messages from other nicks as "
+                f"background noise, not part of this user's conversation."
+            ),
+        },
     ]
 
+    # Only keep turns between this user and the bot, to avoid mixing in random chatter
+    relevant_turns = []
     for entry in history:
         # Each entry is "nick: text"
         try:
             nick, text = entry.split(": ", 1)
         except ValueError:
-            # Fallback if somehow malformed; treat whole thing as user text
-            nick = "user"
-            text = entry
+            # Fallback if somehow malformed; skip it for safety
+            continue
 
+        if nick not in (trigger.nick, bot_nick):
+            continue
+
+        relevant_turns.append((nick, text))
+
+    # Keep only the last ~20 turns for this user/bot pair
+    for nick, text in relevant_turns[-20:]:
         role = "assistant" if nick == bot_nick else "user"
         messages.append({"role": role, "content": text})
+
+    # Add the current user message at the end
+    messages.append({"role": "user", "content": user_message})
 
     # --- Call x.ai API ---
     try:
