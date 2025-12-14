@@ -5,6 +5,7 @@ from collections import deque
 import requests
 import time
 import re
+import threading
 
 
 class GrokSection(types.StaticSection):
@@ -39,15 +40,56 @@ def setup(bot):
     # Per-channel rolling history & last-response time
     bot.memory['grok_history'] = {}   # channel → deque(["nick: text", ...])
     bot.memory['grok_last'] = {}      # channel → timestamp
+    # Locks for per-channel memory access
+    bot.memory['grok_locks'] = {}
+    bot.memory['grok_locks_lock'] = threading.Lock()
 
 
 def send(bot, channel, text):
     max_len = 440
     delay = 1.0
-    for part in [text[i:i + max_len] for i in range(0, len(text), max_len)]:
-        bot.say(part, channel)
-        if len(part) == max_len:
+    # Prefer splitting on whitespace to avoid chopping words mid-token
+    words = text.split()
+    if not words:
+        return
+    part = words[0]
+    parts = []
+    for w in words[1:]:
+        if len(part) + 1 + len(w) <= max_len:
+            part = part + ' ' + w
+        else:
+            parts.append(part)
+            part = w
+    parts.append(part)
+    for p in parts:
+        bot.say(p, channel)
+        if len(p) >= max_len:
             time.sleep(delay)
+
+
+def _get_channel_lock(bot, channel):
+    # Ensure a Lock exists for the channel
+    with bot.memory['grok_locks_lock']:
+        lock = bot.memory['grok_locks'].get(channel)
+        if lock is None:
+            lock = threading.Lock()
+            bot.memory['grok_locks'][channel] = lock
+        return lock
+
+
+def _is_owner(bot, trigger):
+    # Safe owner check: Sopel may expose trigger.owner or have config.core.owner
+    try:
+        cfg_owner = bot.config.core.owner
+    except Exception:
+        cfg_owner = None
+    if isinstance(cfg_owner, (list, tuple)):
+        if trigger.nick in cfg_owner:
+            return True
+    else:
+        if cfg_owner and trigger.nick == cfg_owner:
+            return True
+    return getattr(trigger, 'owner', False)
 
 
 @plugin.event('PRIVMSG')
@@ -75,8 +117,13 @@ def handle(bot, trigger):
         return
 
     # --- Detect whether the bot is explicitly mentioned ---
+    # Match nick boundaries more robustly than \b to allow non-word chars in nicks
     mentioned = bool(
-        re.search(rf'\b{re.escape(bot_nick)}\b', line, re.IGNORECASE)
+        re.search(
+            rf'(^|[^A-Za-z0-9_]){re.escape(bot_nick)}([^A-Za-z0-9_]|$)',
+            line,
+            re.IGNORECASE,
+        )
     )
 
     # --- Prepare text for history ---
@@ -92,13 +139,15 @@ def handle(bot, trigger):
         # No mention: store the line as-is so Grok still has channel context
         text_for_history = line.strip()
 
-    # Initialize per-channel history and append this message
-    history = bot.memory['grok_history'].setdefault(
-        trigger.sender,
-        deque(maxlen=50),
-    )
-    if text_for_history:
-        history.append(f"{trigger.nick}: {text_for_history}")
+    # Initialize per-channel history and append this message (thread-safe)
+    chan_lock = _get_channel_lock(bot, trigger.sender)
+    with chan_lock:
+        history = bot.memory['grok_history'].setdefault(
+            trigger.sender,
+            deque(maxlen=50),
+        )
+        if text_for_history:
+            history.append(f"{trigger.nick}: {text_for_history}")
 
     # If they didn't mention the bot, don't wake it up — just keep the context
     if not mentioned:
@@ -115,12 +164,13 @@ def handle(bot, trigger):
     if re.match(r'^[.!/]', user_message):
         return
 
-    # --- Rate limit: 4 seconds per channel ---
+    # --- Rate limit: 4 seconds per channel (thread-safe) ---
     now = time.time()
-    last = bot.memory['grok_last'].get(trigger.sender, 0)
-    if now - last < 4:
-        return
-    bot.memory['grok_last'][trigger.sender] = now
+    with chan_lock:
+        last = bot.memory['grok_last'].get(trigger.sender, 0)
+        if now - last < 4:
+            return
+        bot.memory['grok_last'][trigger.sender] = now
 
     # --- Build Grok conversation messages from history ---
     messages = [
@@ -138,7 +188,11 @@ def handle(bot, trigger):
 
     # Only keep turns between this user and the bot, to avoid mixing in random chatter
     relevant_turns = []
-    for entry in history:
+    # Snapshot history under lock to avoid races while we build messages
+    with chan_lock:
+        history_snapshot = list(history)
+
+    for entry in history_snapshot:
         # Each entry is "nick: text"
         try:
             nick, text = entry.split(": ", 1)
@@ -173,15 +227,26 @@ def handle(bot, trigger):
             timeout=30,
         )
         r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"].strip()
+        data = r.json()
+        choices = data.get('choices') or []
+        if not choices:
+            bot.logger.warning('Grok API returned no choices: %s', data)
+            return
+        reply = (
+            choices[0].get('message', {}).get('content', '') or ''
+        ).strip()
 
         # === SMART SANITIZATION (no more killing dad jokes) ===
         # 1. Remove code fences
-        reply = re.sub(r'```[\s\S]*?```', ' (code removed) ', reply)
+        new_reply = re.sub(r'```[\s\S]*?```', ' (code removed) ', reply)
+        if new_reply != reply:
+            bot.logger.info('Grok reply had code fences removed (nick=%s)', trigger.nick)
+        reply = new_reply
 
         # 2. Only remove real ASCII art (4+ lines with box-drawing chars)
         if re.search(r'(?:[╔═║╠╣╚╗╩╦╭╮╰╯┃━┏┓┗┛┣┫].*\n){4,}', reply, re.MULTILINE):
-            reply = "I was gonna draw something cool… but I won’t flood the channel "
+            bot.logger.info('Grok reply contained ASCII art and was suppressed (nick=%s)', trigger.nick)
+            reply = "I was gonna draw something cool… but I won’t flood the channel"
 
         # 3. Remove unicode block shading (the big ▓▓▓ stuff)
         reply = re.sub(r'[\u2580-\u259F]{5,}', ' ', reply)
@@ -196,10 +261,11 @@ def handle(bot, trigger):
 
         # 5. Only truncate truly massive replies
         if len(reply) > 1400:
+            bot.logger.info('Grok reply truncated (len=%d, nick=%s)', len(reply), trigger.nick)
             reply = reply[:1390] + " […]"
 
         # Auto-address non-owners if not already mentioned
-        if trigger.nick.lower() not in reply.lower() and not trigger.owner:
+        if trigger.nick.lower() not in reply.lower() and not _is_owner(bot, trigger):
             final_reply = f"{trigger.nick}: {reply}"
         else:
             final_reply = reply
@@ -207,12 +273,12 @@ def handle(bot, trigger):
         # Send reply
         send(bot, trigger.sender, final_reply)
 
-        # Log assistant turn into history for future context
-        history.append(f"{bot_nick}: {reply}")
+        # Log assistant turn into history for future context (thread-safe)
+        with chan_lock:
+            history.append(f"{bot_nick}: {reply}")
 
     except Exception:
-        # Silent fail — bot lives on
-        pass
+        bot.logger.exception('Grok handler failed for channel %s', trigger.sender)
 
 
 @plugin.command('grokreset')
@@ -221,3 +287,4 @@ def reset_history(bot, trigger):
     if trigger.sender in bot.memory['grok_history']:
         del bot.memory['grok_history'][trigger.sender]
     bot.say("Grok history reset for this channel.", trigger.sender)
+
