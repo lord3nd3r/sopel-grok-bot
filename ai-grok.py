@@ -287,4 +287,3 @@ def reset_history(bot, trigger):
     if trigger.sender in bot.memory['grok_history']:
         del bot.memory['grok_history'][trigger.sender]
     bot.say("Grok history reset for this channel.", trigger.sender)
-
