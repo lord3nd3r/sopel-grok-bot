@@ -789,4 +789,3 @@ def reset_history(bot, trigger):
         bot.say("Grok history reset for this channel.", trigger.sender)
     except Exception:
         pass
-
