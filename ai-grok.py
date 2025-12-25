@@ -59,8 +59,18 @@ def setup(bot):
     bot.memory['grok_locks_lock'] = threading.Lock()
     # Initialize a small SQLite DB for optional persistent per-user history
     try:
-        db_path = os.path.join(os.path.dirname(__file__), 'grok.sqlite3')
+        # Allow override via environment for deployments
+        base_dir = os.environ.get('AI_GROK_DIR') or os.path.join(os.path.dirname(__file__), 'grok_data')
+        # Ensure the folder exists (create if missing)
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except Exception:
+            # Fallback to script dir if creation fails
+            base_dir = os.path.dirname(__file__)
+
+        db_path = os.path.join(base_dir, 'grok.sqlite3')
         bot.memory['grok_db_path'] = db_path
+        # Touch the DB (creates file and tables if missing)
         _init_db(bot)
     except Exception:
         _log(bot).exception('Failed to initialize Grok DB')
@@ -345,6 +355,104 @@ def handle(bot, trigger):
     ]
     if any(re.search(p, line, re.IGNORECASE) for p in noise_patterns):
         return
+
+    # --- Handle CTCP ACTION (/me) or simple emote lines locally ---
+    # CTCP ACTION messages are wrapped like: \x01ACTION pets glitchy\x01
+    # Also accept conventional '/me pets glitchy' text.
+    _log(bot).warning('Checking emote for line: %r, bot_nick: %s', line, bot.nick)
+    try:
+        action_text = None
+        m = re.match(r'^\x01ACTION\s+(.+?)\x01$', line)
+        if m:
+            action_text = m.group(1)
+        elif line.startswith('/me '):
+            action_text = line[4:]
+
+        if action_text:
+            # If the action targets this bot (mentions bot nick), respond locally
+            bot_nick = bot.nick
+            if re.search(rf'\b{re.escape(bot_nick)}\b', action_text, re.IGNORECASE) or re.search(rf'\b{re.escape(bot_nick)}\b', line, re.IGNORECASE):
+                verb = action_text.split()[0].lower()
+                # Map some common verbs to cute/appropriate replies
+                reply_map = {
+                    'pet': 'purrs back at 😺',
+                    'pets': 'purrs back at 😺',
+                    'pat': 'purrs back at 😺',
+                    'pats': 'purrs back at 😺',
+                    'hug': 'hugs back 🤗',
+                    'hugs': 'hugs back 🤗',
+                    'poke': 'hisses back at 😾',
+                    'pokes': 'hisses back at 😾',
+                    'kiss': 'blushes and kisses back 😘',
+                    'kisses': 'blushes and kisses back 😘',
+                    'stroke': 'purrs back at 😺',
+                    'strokes': 'purrs back at 😺',
+                    'smack': 'hisses back at 😾',
+                    'smacks': 'hisses back at 😾',
+                    'slap': 'hisses back at 😾',
+                    'slaps': 'hisses back at 😾',
+                    'bonk': 'ow! 😵',
+                    'bonks': 'ow! 😵',
+                    'kick': 'ow! 😵',
+                    'kicks': 'ow! 😵',
+                    'punch': 'grunts 😤',
+                    'punches': 'grunts 😤',
+                }
+                short = reply_map.get(verb, None)
+                if short:
+                    # Use an ACTION reply so it's an emote
+                    _log(bot).warning('CTCP emote: verb=%s, reply=%s', verb, short)
+                    try:
+                        bot.action(f"{short} {trigger.nick}", trigger.sender)
+                    except Exception:
+                        pass
+                    return
+                else:
+                    # Generic friendly emote
+                    _log(bot).warning('CTCP emote: generic acknowledge')
+                    try:
+                        bot.action(f"acknowledges {trigger.nick} with a smile 😊", trigger.sender)
+                    except Exception:
+                        pass
+                    return
+    except Exception:
+        # If emote handling fails, continue to normal flow
+        pass
+    # Secondary emote detection: sometimes clients print emotes without CTCP
+    # e.g., "* <nick> pets glitchy" or plain text "@End3r pets glitchy".
+    try:
+        bot_nick = bot.nick
+        # Normalize: strip leading '* ' often used by clients to show emotes
+        stripped = re.sub(r'^\*\s*', '', line)
+        # look for any known verb near the bot's nick
+        verbs_re = r'\b(pet|pets|pat|pats|hug|hugs|poke|pokes|kiss|kisses|stroke|strokes|smack|smacks|slap|slaps|bonk|bonks|kick|kicks|punch|punches)\b'
+        has_verb = re.search(verbs_re, stripped, re.IGNORECASE)
+        # Nick match: accept word-boundary match OR simple substring (handles @nick)
+        has_nick = bool(re.search(rf'(^|[^A-Za-z0-9_]){re.escape(bot_nick)}([^A-Za-z0-9_]|$)', stripped, re.IGNORECASE) or (bot_nick.lower() in stripped.lower()))
+        if has_verb and has_nick:
+            m2 = has_verb
+            verb = m2.group(1).lower()
+            # reuse reply_map from above
+            reply_map2 = {
+                'pet': 'purrs back at 😺', 'pets': 'purrs back at 😺', 'pat': 'purrs back at 😺', 'pats': 'purrs back at 😺',
+                'hug': 'hugs back 🤗', 'hugs': 'hugs back 🤗',
+                'poke': 'hisses back at 😾', 'pokes': 'hisses back at 😾',
+                'kiss': 'blushes and kisses back 😘', 'kisses': 'blushes and kisses back 😘',
+                'stroke': 'purrs back at 😺', 'strokes': 'purrs back at 😺',
+                'smack': 'hisses back at 😾', 'smacks': 'hisses back at 😾',
+                'slap': 'hisses back at 😾', 'slaps': 'hisses back at 😾',
+                'bonk': 'ow! 😵', 'bonks': 'ow! 😵', 'kick': 'ow! 😵', 'kicks': 'ow! 😵',
+                'punch': 'grunts 😤', 'punches': 'grunts 😤',
+            }
+            short = reply_map2.get(verb, 'acknowledges with a smile 😊')
+            _log(bot).warning('Secondary emote: verb=%s, reply=%s, stripped=%r', verb, short, stripped)
+            try:
+                bot.action(f"{short} {trigger.nick}", trigger.sender)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
 
     # --- Detect whether the bot is explicitly mentioned ---
     # In PMs we treat the user message as an implicit mention (they're talking to the bot)
@@ -740,8 +848,9 @@ def handle(bot, trigger):
         _log(bot).exception('Grok handler failed for channel %s', trigger.sender)
 
 
-@plugin.command('grokreset')
-def reset_history(bot, trigger):
+@plugin.command('testemote')
+def testemote(bot, trigger):
+    bot.say('Emote plugin loaded, bot nick: ' + bot.nick)
     """Reset Grok history.
 
     - In channels: only the bot owner may run this and it clears channel history.
