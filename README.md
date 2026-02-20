@@ -11,7 +11,7 @@ A feature-rich Sopel plugin that integrates [xAI's Grok](https://x.ai) into your
 - **Persistent per-user history** — conversation context is saved to a local SQLite database so the bot remembers past exchanges across restarts.
 - **Time & date queries** — detects time/date questions and answers with the user's saved timezone and format preference (defaults to UTC 24-hour).
 - **User timezone/format preferences** — users can tell the bot their timezone (`I'm in CST`) or preferred time format (`I prefer 12-hour`) and it will remember them.
-- **Context-aware channel history** — non-addressed messages are stored to give Grok background context without waking the bot.
+- **Channel-wide context awareness** — the bot passively reads all channel messages and uses them as background context, so you can ask it questions about what other users said (e.g. "what did KnownSyntax add to his beer?").
 - **Review mode** — ask the bot for a quick opinion on the recent conversation ("Grok: what do you think?").
 - **CTCP emote responses** — the bot responds to IRC `/me` actions directed at it (pets, hugs, boops, etc.) with fun random replies.
 - **Admin PM commands** — bot admins can manage channels and ignore lists via PM commands.
@@ -81,6 +81,20 @@ Address the bot by nick in a channel or send it a PM:
 <you> BotNick: what do you think about Rust?
 <BotNick> you: Rust is great for systems programming — strong safety guarantees …
 ```
+
+### Channel context questions
+
+The bot passively stores what everyone in the channel says. You can ask it about prior conversation:
+
+```
+<End3r> glitchy: what did KnownSyntax add to his beer?
+<glitchy> End3r: KnownSyntax said to add an extra lime to it.
+
+<End3r> glitchy: what beer was I having?
+<glitchy> End3r: You were having a Corona.
+```
+
+Up to the last ~40 lines of channel activity (across all nicks) are included as context on every reply.
 
 ### Live web search
 
