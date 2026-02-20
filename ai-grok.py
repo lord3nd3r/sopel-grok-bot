@@ -1501,6 +1501,63 @@ def handle(bot, trigger):
         relevant_turns = collected
 
     if not review_mode:
+        # --- Inject recent channel-wide lines as background context ---
+        # Collect lines from ALL nicks in this channel (not just this user/bot pair)
+        # so Grok can answer questions like "what did KnownSyntax say?" or
+        # "what beer did End3r have?".
+        if not is_pm:
+            try:
+                channel_bg = []
+                with chan_lock:
+                    for k, dq in bot.memory.get('grok_history', {}).items():
+                        try:
+                            if isinstance(k, tuple) and k[0] == trigger.sender:
+                                for item in list(dq):
+                                    try:
+                                        n, t = item.split(": ", 1)
+                                        channel_bg.append((n, t))
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            continue
+
+                # Deduplicate while preserving order (multiple per-user deques overlap)
+                seen_bg = set()
+                unique_bg = []
+                for n, t in channel_bg:
+                    key = (n.lower(), t)
+                    if key not in seen_bg:
+                        seen_bg.add(key)
+                        unique_bg.append((n, t))
+
+                # Keep the most recent lines within a character budget
+                BG_CHAR_BUDGET = 1500
+                BG_MAX_LINES = 40
+                bg_collected = []
+                bg_chars = 0
+                for n, t in reversed(unique_bg):
+                    l = len(n) + len(t) + 3
+                    if bg_chars + l > BG_CHAR_BUDGET and bg_collected:
+                        break
+                    if len(bg_collected) >= BG_MAX_LINES:
+                        break
+                    bg_collected.append((n, t))
+                    bg_chars += l
+                bg_collected.reverse()  # back to chronological order
+
+                if bg_collected:
+                    bg_lines = [f"{n}: {t}" for n, t in bg_collected]
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Recent channel conversation (for context — refers to other users, "
+                            "not the current conversation with you):\n"
+                            + "\n".join(bg_lines)
+                        ),
+                    })
+            except Exception:
+                pass
+
         # Keep only the last N turns for this user/bot pair
         for nick, text in relevant_turns[-MAX_HISTORY_PER_USER:]:
             role = "assistant" if nick == bot_nick else "user"
