@@ -1550,8 +1550,10 @@ def handle(bot, trigger):
                     messages.append({
                         "role": "system",
                         "content": (
-                            "Recent channel conversation (for context — refers to other users, "
-                            "not the current conversation with you):\n"
+                            "Recent channel conversation log (each line is 'nick: message'). "
+                            "When asked who said something or what a specific user said, "
+                            "always answer accurately based on this log — name the correct nick. "
+                            "Do not invent or attribute statements to yourself or the wrong person.\n\n"
                             + "\n".join(bg_lines)
                         ),
                     })
